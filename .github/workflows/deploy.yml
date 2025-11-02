@@ -1,0 +1,207 @@
+name: Go Server CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  DOCKERFILE_PATH: ./Dockerfile
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build server
+        run: go build ./server
+
+      - name: Notify Slack (build)
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "text": ":hammer_and_wrench: *Build job* - `${{ job.status }}`\n브랜치: `${{ github.ref_name }}`\n커밋: ${{ github.sha }}"
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Notify Slack (test)
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "text": ":test_tube: *Test job* - `${{ job.status }}`\n브랜치: `${{ github.ref_name }}`\n커밋: ${{ github.sha }}"
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  build_and_push_docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-name: ${{ steps.export.outputs.image-name }}
+      image-tag: ${{ steps.export.outputs.image-tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Export image metadata
+        id: export
+        run: |
+          echo "image-name=${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          echo "image-tag=${{ steps.meta.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+  request_deployment_approval:
+    name: Request Deployment Approval
+    runs-on: ubuntu-latest
+    needs: build_and_push_docker
+    timeout-minutes: 30
+
+    steps:
+      - name: Send deployment approval request
+        uses: TigerWest/slack-approval@v1.1.0
+        env:
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        with:
+          approvers: ${{ secrets.SLACK_APPROVERS }}
+          minimumApprovalCount: "1"
+          baseMessagePayload: |
+            {
+              "text": "배포 승인이 필요합니다.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*배포 승인 요청*\n리포지토리: `${{ github.repository }}`\n이미지: `${{ needs.build_and_push_docker.outputs.image-name }}:${{ needs.build_and_push_docker.outputs.image-tag }}`"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "승인 시 자동으로 배포가 진행됩니다."
+                    }
+                  ]
+                }
+              ]
+            }
+
+  deploy_to_dev:
+    name: Deploy to Development Server
+    runs-on: ubuntu-latest
+    needs: request_deployment_approval
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy deployment script
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "scripts/deploy.sh"
+          target: "/tmp"
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }},GITHUB_ACTOR=${{ github.actor }},CONTAINER_NAME=slack-bot-poc-dev
+          script: |
+            chmod +x /tmp/scripts/deploy.sh
+            /tmp/scripts/deploy.sh "${{ needs.build_and_push_docker.outputs.image-tag }}" "${{ needs.build_and_push_docker.outputs.image-name }}"
+
+  notify_slack:
+    name: Notify Slack of Workflow Status
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - test
+      - build_and_push_docker
+      - request_deployment_approval
+      - deploy_to_dev
+    if: always()
+
+    steps:
+      - name: Send final status
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "text": ":white_check_mark: *CI/CD 실행 결과*\nBuild: `${{ needs.build.result }}`\nTest: `${{ needs.test.result }}`\nDocker: `${{ needs.build_and_push_docker.result }}`\nApproval: `${{ needs.request_deployment_approval.result }}`\nDeploy: `${{ needs.deploy_to_dev.result }}`"
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
